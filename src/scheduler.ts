@@ -91,13 +91,21 @@ export function busyForDate(dateStr: string, events: FixedEvent[]): Interval[] {
 
 const PRIORITY_ORDER: Record<TaskPriority, number> = { high: 0, medium: 1, low: 2 };
 
+// Сколько минут занимает блок работы с учётом перерывов:
+// после каждых breakInterval минут работы — перерыв, включая хвостовой
+// (20 мин работы при 15/5 → 25; 15 мин → 20, перерыв встаёт между задачами).
+export function occupiedMinutes(durationMinutes: number, settings: Settings): number {
+  const breaks = Math.max(0, Math.floor(durationMinutes / settings.breakInterval));
+  return durationMinutes + breaks * settings.breakDuration;
+}
+
 /**
  * Пересобирает расписание: незавершённые и ещё не начатые задачи расставляются
  * заново (ASAP от начала дня, не позже дедлайна), задачи, за которыми уже шёл
  * трекинг, сохраняют свой слот и занимают время. Возвращает новый массив в том
  * же порядке; неизменённые задачи возвращаются как есть (по ссылке).
  */
-export function scheduleTasks(tasks: Task[], events: FixedEvent[], settings: Settings): Task[] {
+export function scheduleTasks(tasks: Task[], events: FixedEvent[], settings: Settings, activeTaskId: string | null = null): Task[] {
   const from = localDateStr();
   const now = new Date();
   const nowMinutes = now.getHours() * 60 + now.getMinutes();
@@ -105,18 +113,28 @@ export function scheduleTasks(tasks: Task[], events: FixedEvent[], settings: Set
   const dayEnd = timeToMinutes(settings.dayEnd);
   if (dayEnd <= dayStart) return tasks;
 
-  // Занятое время: начатые задачи держат свой слот
+  // Закреплённый слот держит только активная задача (выбранная в таймере) —
+  // остальные начатые, но недоделанные уходят в кандидаты на остаток и
+  // «плывут» вниз. Слот в прошлом не закрепляется в любом случае.
   const busyByDate = new Map<string, Interval[]>();
+  const pinned = new Set<string>();
+  // Конец слота активной задачи — динамический: max(старт, сейчас) + остаток
+  // работы с перерывами. На паузе блок растёт и сдвигает дела ниже.
+  const pinnedInterval = (t: Task): Interval => {
+    const start = timeToMinutes(t.scheduledStart!);
+    const remainingMin = Math.max(1, Math.ceil(t.durationMinutes - t.trackedSeconds / 60));
+    const anchor = t.scheduledDate === from ? Math.max(start, nowMinutes) : start;
+    return { start, end: anchor + occupiedMinutes(remainingMin, settings) };
+  };
   for (const t of tasks) {
-    if (t.done || t.trackedSeconds <= 0 || !t.scheduledDate || !t.scheduledStart) continue;
-    const start = timeToMinutes(t.scheduledStart);
-    const list = busyByDate.get(t.scheduledDate) ?? [];
-    list.push({ start, end: start + t.durationMinutes });
-    busyByDate.set(t.scheduledDate, list);
+    if (t.done || !t.scheduledDate || !t.scheduledStart || t.scheduledDate < from) continue;
+    if (t.id !== activeTaskId) continue;
+    pinned.add(t.id);
+    busyByDate.set(t.scheduledDate, [...(busyByDate.get(t.scheduledDate) ?? []), pinnedInterval(t)]);
   }
 
   const candidates = tasks
-    .filter((t) => !t.done && t.trackedSeconds === 0)
+    .filter((t) => !t.done && !pinned.has(t.id))
     .sort((a, b) => {
       if (a.deadline !== b.deadline) return a.deadline.localeCompare(b.deadline);
       const p = PRIORITY_ORDER[a.priority] - PRIORITY_ORDER[b.priority];
@@ -124,34 +142,64 @@ export function scheduleTasks(tasks: Task[], events: FixedEvent[], settings: Set
       return a.createdAt - b.createdAt;
     });
 
-  const assigned = new Map<string, { date: string; start: string }>();
+  const assigned = new Map<string, { date: string; start: string; end: string }>();
+  // Накопительная модель перерывов: сколько минут работы прошло с последнего
+  // перерыва в этом дне и где закончился предыдущий занятый блок.
+  const accumByDate = new Map<string, number>();
+  const lastEndByDate = new Map<string, number>();
 
   for (const task of candidates) {
+    const workMin = Math.max(1, Math.ceil(task.durationMinutes - task.trackedSeconds / 60));
     let placed = false;
-    for (let date = from; date <= task.deadline; date = addDays(date, 1)) {
+    for (let date = from; date <= task.deadline && !placed; date = addDays(date, 1)) {
       const windowStart = date === from ? Math.max(dayStart, nowMinutes) : dayStart;
       const busy = [...busyForDate(date, events), ...(busyByDate.get(date) ?? [])];
       const free = subtract({ start: windowStart, end: dayEnd }, busy);
-      const slot = free.find((f) => f.end - f.start >= task.durationMinutes);
-      if (slot) {
-        assigned.set(task.id, { date, start: minutesToTime(slot.start) });
-        busyByDate.set(date, [...busy, { start: slot.start, end: slot.start + task.durationMinutes }]);
-        placed = true;
-        break;
+      const accumBase = accumByDate.get(date) ?? 0;
+      const lastEnd = lastEndByDate.get(date) ?? windowStart;
+
+      for (const f of free) {
+        // Свободный зазор перед слотом считаем отдыхом — цикл перерывов сбрасывается
+        let accum = f.start - lastEnd >= settings.breakDuration ? 0 : accumBase;
+        let p = f.start;
+        let w = workMin;
+        while (w > 0 && p < f.end) {
+          const chunk = Math.min(settings.breakInterval - accum, w, f.end - p);
+          p += chunk;
+          w -= chunk;
+          accum += chunk;
+          if (accum >= settings.breakInterval) {
+            p += settings.breakDuration;
+            accum = 0;
+          }
+        }
+        if (w <= 0 && p <= f.end) {
+          assigned.set(task.id, { date, start: minutesToTime(f.start), end: minutesToTime(p) });
+          busyByDate.set(date, [...busy, { start: f.start, end: p }]);
+          accumByDate.set(date, accum);
+          lastEndByDate.set(date, p);
+          placed = true;
+          break;
+        }
       }
     }
-    if (!placed) assigned.set(task.id, { date: "", start: "" });
+    if (!placed) assigned.set(task.id, { date: "", start: "", end: "" });
   }
 
   return tasks.map((t) => {
+    if (pinned.has(t.id)) {
+      const endStr = minutesToTime(pinnedInterval(t).end);
+      return t.scheduledEnd === endStr ? t : { ...t, scheduledEnd: endStr };
+    }
     const a = assigned.get(t.id);
     if (!a) return t;
     const date = a.date || null;
     const start = a.start || null;
-    if (t.scheduledDate === date && t.scheduledStart === start) return t;
+    const end = a.end || null;
+    if (t.scheduledDate === date && t.scheduledStart === start && t.scheduledEnd === end) return t;
     // Уведомление о старте сбрасываем только при переносе на другой день:
     // сдвиг времени внутри дня не должен дублировать уведомление.
-    return { ...t, scheduledDate: date, scheduledStart: start, startNotified: t.scheduledDate === date ? t.startNotified : false };
+    return { ...t, scheduledDate: date, scheduledStart: start, scheduledEnd: end, startNotified: t.scheduledDate === date ? t.startNotified : false };
   });
 }
 
@@ -168,7 +216,8 @@ export function freeMinutesForDate(dateStr: string, events: FixedEvent[], tasks:
   for (const t of tasks) {
     if (t.done || t.scheduledDate !== dateStr || !t.scheduledStart) continue;
     const start = timeToMinutes(t.scheduledStart);
-    busy.push({ start, end: start + t.durationMinutes });
+    const end = t.scheduledEnd ? timeToMinutes(t.scheduledEnd) : start + occupiedMinutes(t.durationMinutes, settings);
+    busy.push({ start, end });
   }
   return subtract({ start: windowStart, end: dayEnd }, busy).reduce((s, f) => s + (f.end - f.start), 0);
 }

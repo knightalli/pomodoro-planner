@@ -2,9 +2,11 @@ import { usePomodoro } from "./usePomodoro";
 import { Settings, ReminderType, Task, FixedEvent, TaskPriority, formatClock, formatDuration } from "./types";
 import {
   localDateStr, parseDate, timeToMinutes, minutesToTime,
-  formatDayLabel, formatDateShort, freeMinutesForDate, WEEKDAYS_SHORT,
+  formatDayLabel, formatDateShort, freeMinutesForDate, occupiedMinutes, WEEKDAYS_SHORT,
 } from "./scheduler";
 import { useState, useEffect } from "react";
+import { TOAST_EVENT, AppToast, notifyTaskStart } from "./notifications";
+import { toggleWidgetWindow } from "./platform";
 import "./App.css";
 
 type Tab = "timer" | "stats" | "reminders" | "planner";
@@ -14,6 +16,47 @@ const PRIORITY_LABEL: Record<TaskPriority, string> = {
   medium: "средний",
   low: "низкий",
 };
+
+// Выбор времени в 24-часовом формате: два селекта ЧЧ : ММ
+function TimeInput({ value, onChange }: { value: string; onChange: (v: string) => void }) {
+  const [h = "00", m = "00"] = (value || "00:00").split(":");
+  const opts = (n: number) => Array.from({ length: n }, (_, i) => i.toString().padStart(2, "0"));
+  return (
+    <span className="time-input">
+      <select value={h} onChange={(e) => onChange(`${e.target.value}:${m}`)}>
+        {opts(24).map((x) => <option key={x} value={x}>{x}</option>)}
+      </select>
+      <span className="time-sep">:</span>
+      <select value={m} onChange={(e) => onChange(`${h}:${e.target.value}`)}>
+        {opts(60).map((x) => <option key={x} value={x}>{x}</option>)}
+      </select>
+    </span>
+  );
+}
+
+// Прогресс-бар задачи по слоту: зелёные полосы — перерывы, синяя заливка — отработано
+function TaskProgressBar({ durationMinutes, trackedSeconds, settings }: { durationMinutes: number; trackedSeconds: number; settings: Settings }) {
+  const biSec = settings.breakInterval * 60;
+  const bdSec = settings.breakDuration * 60;
+  const occSec = Math.max(1, occupiedMinutes(durationMinutes, settings) * 60);
+  const bands: { left: number; width: number }[] = [];
+  for (let k = 1; k * biSec <= durationMinutes * 60; k++) {
+    const start = k * biSec + (k - 1) * bdSec;
+    bands.push({ left: (start / occSec) * 100, width: (bdSec / occSec) * 100 });
+  }
+  // Позиция в слоте = отработанные секунды + уже пройденные перерывы
+  const pos = trackedSeconds <= 0
+    ? 0
+    : Math.min(occSec, trackedSeconds + Math.floor((trackedSeconds - 1) / biSec) * bdSec);
+  return (
+    <div className="tl-progress">
+      {bands.map((b, i) => (
+        <span key={i} className="tl-break-band" style={{ left: `${b.left}%`, width: `${b.width}%` }} />
+      ))}
+      <div className="tl-progress-fill" style={{ width: `${(pos / occSec) * 100}%` }} />
+    </div>
+  );
+}
 
 interface TimelineItem {
   kind: "event" | "task";
@@ -37,10 +80,9 @@ function buildSectionRows(state: { sections: { id: string; name: string; tracked
 function App() {
   const {
     state, startTracking, stopTracking, pauseTracking, resumeTracking, updateSettings,
-    addSection, removeSection, selectSection,
     addReminder, removeReminder, toggleReminder, confirmReminder,
-    addTask, removeTask, toggleTaskDone, startTask,
-    addFixedEvent, removeFixedEvent, setDayBounds,
+    addTask, updateTask, removeTask, toggleTaskDone, postponeTask, startTask, selectTask,
+    addFixedEvent, updateFixedEvent, removeFixedEvent, setDayBounds,
     setShowDailyStats, setAutoStart,
   } = usePomodoro();
   const [tab, setTab] = useState<Tab>("timer");
@@ -53,9 +95,6 @@ function App() {
     intervalMinutes: 60,
     specificTime: "12:00",
   });
-  const [sectionModal, setSectionModal] = useState(false);
-  const [newSectionName, setNewSectionName] = useState("");
-  const [deleteSectionId, setDeleteSectionId] = useState<string | null>(null);
   const [selectedDay, setSelectedDay] = useState(0);
   const [plannerDate, setPlannerDate] = useState(() => localDateStr());
   const [newTask, setNewTask] = useState<{ name: string; durationMinutes: number; priority: TaskPriority; deadline: string }>({
@@ -71,12 +110,41 @@ function App() {
     days: [1, 2, 3, 4, 5],
   });
   const [showEventForm, setShowEventForm] = useState(false);
+  const [editingEventId, setEditingEventId] = useState<string | null>(null);
+  const [editingTaskId, setEditingTaskId] = useState<string | null>(null);
+  const [toasts, setToasts] = useState<(AppToast & { id: number })[]>([]);
+
+  useEffect(() => {
+    const onToast = (e: Event) => {
+      const { title, body } = (e as CustomEvent<AppToast>).detail;
+      const id = Date.now() + Math.random();
+      setToasts((prev) => [...prev, { id, title, body }]);
+      window.setTimeout(() => {
+        setToasts((prev) => prev.filter((t) => t.id !== id));
+      }, 8000);
+    };
+    window.addEventListener(TOAST_EVENT, onToast);
+    return () => window.removeEventListener(TOAST_EVENT, onToast);
+  }, []);
 
   const isBreak = state.isOnBreak;
-  const displaySeconds = isBreak ? state.breakSecondsLeft : state.workSeconds;
+  const activeSection = state.sections.find((s) => s.id === state.activeSectionId);
+  const activeTask = state.tasks.find((t) => !t.done && t.sectionId !== null && t.sectionId === state.activeSectionId);
+  const openTasks = state.tasks.filter((t) => !t.done);
+  const todayTasks = openTasks
+    .filter((t) => t.scheduledDate === localDateStr())
+    .sort((a, b) => (a.scheduledStart ?? "").localeCompare(b.scheduledStart ?? ""));
+  const otherTasks = openTasks
+    .filter((t) => t.scheduledDate !== localDateStr())
+    .sort((a, b) => a.deadline.localeCompare(b.deadline));
+  // С выбранной задачей таймер идёт на обратный отсчёт её остатка; без задачи — счёт до перерыва
+  const taskRemaining = activeTask ? Math.max(0, activeTask.durationMinutes * 60 - activeTask.trackedSeconds) : null;
+  const displaySeconds = isBreak ? state.breakSecondsLeft : taskRemaining ?? state.workSeconds;
   const progress = isBreak
     ? 1 - state.breakSecondsLeft / (state.settings.breakDuration * 60)
-    : state.workSeconds / (state.settings.breakInterval * 60);
+    : activeTask
+      ? Math.min(1, activeTask.trackedSeconds / (activeTask.durationMinutes * 60))
+      : state.workSeconds / (state.settings.breakInterval * 60);
 
   const handleSaveSettings = () => {
     updateSettings(draftSettings);
@@ -102,57 +170,60 @@ function App() {
     setPlannerDate(localDateStr(d));
   };
 
-  const handleAddTask = () => {
-    const name = newTask.name.trim();
-    if (!name || newTask.durationMinutes <= 0 || !newTask.deadline) return;
-    addTask({
-      name,
-      durationMinutes: newTask.durationMinutes,
-      priority: newTask.priority,
-      deadline: newTask.deadline,
-    });
+  const resetTaskForm = () => {
     setNewTask((p) => ({ ...p, name: "" }));
+    setEditingTaskId(null);
   };
 
-  const handleAddEvent = () => {
+  const handleSaveTask = () => {
+    const name = newTask.name.trim();
+    if (!name || newTask.durationMinutes <= 0 || !newTask.deadline) return;
+    const data = { name, durationMinutes: newTask.durationMinutes, priority: newTask.priority, deadline: newTask.deadline };
+    if (editingTaskId) {
+      updateTask(editingTaskId, data);
+      resetTaskForm();
+    } else {
+      addTask(data);
+      setNewTask((p) => ({ ...p, name: "" }));
+    }
+  };
+
+  const handleEditTask = (t: Task) => {
+    setNewTask({ name: t.name, durationMinutes: t.durationMinutes, priority: t.priority, deadline: t.deadline });
+    setEditingTaskId(t.id);
+  };
+
+  const resetEventForm = () => {
+    setNewEvent({ name: "", startTime: "09:00", endTime: "13:00", days: [1, 2, 3, 4, 5] });
+    setEditingEventId(null);
+  };
+
+  const handleSaveEvent = () => {
     const name = newEvent.name.trim();
     if (!name || newEvent.days.length === 0 || newEvent.endTime <= newEvent.startTime) return;
-    addFixedEvent({ name, startTime: newEvent.startTime, endTime: newEvent.endTime, days: [...newEvent.days] });
-    setNewEvent({ name: "", startTime: "09:00", endTime: "13:00", days: [1, 2, 3, 4, 5] });
+    const data = { name, startTime: newEvent.startTime, endTime: newEvent.endTime, days: [...newEvent.days] };
+    if (editingEventId) {
+      updateFixedEvent(editingEventId, data);
+    } else {
+      addFixedEvent(data);
+    }
+    resetEventForm();
     setShowEventForm(false);
+  };
+
+  const handleEditEvent = (e: FixedEvent) => {
+    setNewEvent({ name: e.name, startTime: e.startTime, endTime: e.endTime, days: [...e.days] });
+    setEditingEventId(e.id);
+    setShowEventForm(true);
   };
 
   const handleShowWidget = async () => {
     try {
-      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      const existing = await WebviewWindow.getByLabel("widget");
-      if (existing) {
-        const isVisible = await existing.isVisible();
-        if (isVisible) {
-          await existing.hide();
-        } else {
-          await existing.show();
-          await existing.setFocus();
-        }
-        return;
-      }
-      new WebviewWindow("widget", {
-        url: "widget.html",
-        title: "Тайм-трекер",
-        width: 140,
-        height: 80,
-        resizable: false,
-        decorations: false,
-        alwaysOnTop: true,
-        transparent: true,
-        skipTaskbar: true,
-      });
+      await toggleWidgetWindow();
     } catch {
       // Widget window not available in browser dev
     }
   };
-
-  const activeSection = state.sections.find((s) => s.id === state.activeSectionId);
 
   useEffect(() => {
     if (tab !== "reminders" && tab !== "planner") return;
@@ -203,22 +274,29 @@ function App() {
 
       {tab === "timer" && (
         <>
-          {/* Section dropdown - above timer */}
+          {/* Task selector - above timer */}
           <div className="section-selector">
             <select
-              value={state.activeSectionId ?? ""}
-              onChange={(e) => selectSection(e.target.value)}
+              value={activeTask?.id ?? ""}
+              onChange={(e) => selectTask(e.target.value || null)}
               className="section-dropdown"
             >
-              <option value="">— Выберите раздел —</option>
-              {[...state.sections].sort((a, b) => a.name.localeCompare(b.name)).map((s) => (
-                <option key={s.id} value={s.id}>{s.name}</option>
-              ))}
+              <option value="">— Без задачи —</option>
+              {todayTasks.length > 0 && (
+                <optgroup label="Сегодня по плану">
+                  {todayTasks.map((t) => (
+                    <option key={t.id} value={t.id}>{t.scheduledStart} {t.name}</option>
+                  ))}
+                </optgroup>
+              )}
+              {otherTasks.length > 0 && (
+                <optgroup label="Остальные задачи">
+                  {otherTasks.map((t) => (
+                    <option key={t.id} value={t.id}>{t.name} (до {formatDateShort(t.deadline)})</option>
+                  ))}
+                </optgroup>
+              )}
             </select>
-            <button className="btn-secondary btn-small" onClick={() => { setNewSectionName(""); setSectionModal(true); }}>＋</button>
-            {state.activeSectionId && (
-              <button className="btn-secondary btn-small btn-danger" onClick={() => setDeleteSectionId(state.activeSectionId!)}>✕</button>
-            )}
           </div>
 
           {/* Timer */}
@@ -237,10 +315,25 @@ function App() {
             <div className="timer-display">
               <span className="time">{formatClock(displaySeconds)}</span>
               <span className="mode-label">
-                {isBreak ? "☕ Перерыв" : activeSection ? activeSection.name : "Без раздела"}
+                {isBreak ? "☕ Перерыв" : activeTask ? activeTask.name : activeSection ? activeSection.name : "Без задачи"}
               </span>
             </div>
           </div>
+
+          {/* Selected task progress */}
+          {activeTask && !isBreak && (
+            <div className="timer-task-progress">
+              <span>{formatDuration(activeTask.trackedSeconds)} / {formatDuration(activeTask.durationMinutes * 60)}</span>
+              <TaskProgressBar
+                durationMinutes={activeTask.durationMinutes}
+                trackedSeconds={activeTask.trackedSeconds}
+                settings={state.settings}
+              />
+            </div>
+          )}
+          {!isBreak && state.isTracking && (
+            <span className="timer-break-left">☕ Перерыв через {formatClock(Math.max(0, state.nextBreakThreshold - state.workSeconds))}</span>
+          )}
 
           {/* Controls - main Start/Stop centered */}
           <div className="controls-main">
@@ -282,7 +375,8 @@ function App() {
         for (const t of state.tasks) {
           if (t.scheduledDate !== plannerDate || !t.scheduledStart) continue;
           const start = timeToMinutes(t.scheduledStart);
-          items.push({ kind: "task", id: t.id, start, end: start + t.durationMinutes, event: null, task: t });
+          const end = t.scheduledEnd ? timeToMinutes(t.scheduledEnd) : start + occupiedMinutes(t.durationMinutes, state.settings);
+          items.push({ kind: "task", id: t.id, start, end, event: null, task: t });
         }
         items.sort((a, b) => a.start - b.start || a.end - b.end);
         const unscheduled = state.tasks.filter((t) => !t.done && !t.scheduledDate);
@@ -303,9 +397,9 @@ function App() {
                 )}
               </div>
               <div className="day-bounds">
-                <input type="time" value={state.settings.dayStart} onChange={(e) => setDayBounds(e.target.value, state.settings.dayEnd)} />
+                <TimeInput value={state.settings.dayStart} onChange={(v) => setDayBounds(v, state.settings.dayEnd)} />
                 <span>—</span>
-                <input type="time" value={state.settings.dayEnd} onChange={(e) => setDayBounds(state.settings.dayStart, e.target.value)} />
+                <TimeInput value={state.settings.dayEnd} onChange={(v) => setDayBounds(state.settings.dayStart, v)} />
               </div>
             </div>
 
@@ -328,7 +422,6 @@ function App() {
                     );
                   }
                   const t = item.task!;
-                  const progress = Math.min(1, t.trackedSeconds / (t.durationMinutes * 60));
                   return (
                     <div key={`t-${item.id}`} className={`timeline-item task prio-${t.priority} ${t.done ? "done" : ""} ${isNow ? "now" : ""} ${isPast && !t.done ? "past" : ""}`}>
                       <span className="tl-time">{t.scheduledStart}–{minutesToTime(item.end)}</span>
@@ -339,14 +432,16 @@ function App() {
                         </div>
                         <div className="tl-meta">
                           <span>{formatDuration(t.trackedSeconds)} / {formatDuration(t.durationMinutes * 60)}</span>
+                          {occupiedMinutes(t.durationMinutes, state.settings) > t.durationMinutes && <span className="tl-breaks">+ перерывы</span>}
                           {t.deadline !== plannerDate && <span className="tl-deadline">до {formatDateShort(t.deadline)}</span>}
                         </div>
                         {!t.done && (
-                          <div className="tl-progress"><div className="tl-progress-fill" style={{ width: `${progress * 100}%` }} /></div>
+                          <TaskProgressBar durationMinutes={t.durationMinutes} trackedSeconds={t.trackedSeconds} settings={state.settings} />
                         )}
                       </div>
                       <div className="tl-actions">
                         {!t.done && <button className="tl-btn start" title="Трекать задачу" onClick={() => startTask(t.id)}>▶</button>}
+                        {!t.done && <button className="tl-btn edit" title="Редактировать" onClick={() => handleEditTask(t)}>✎</button>}
                         <button className="tl-btn ok" title={t.done ? "Вернуть в работу" : "Выполнено"} onClick={() => toggleTaskDone(t.id)}>{t.done ? "↺" : "✓"}</button>
                         <button className="tl-btn remove" title="Удалить" onClick={() => removeTask(t.id)}>✕</button>
                       </div>
@@ -372,6 +467,9 @@ function App() {
                       </div>
                     </div>
                     <div className="tl-actions">
+                      <button className="tl-btn start" title="Начать сейчас" onClick={() => startTask(t.id)}>▶</button>
+                      <button className="tl-btn edit" title="Редактировать" onClick={() => handleEditTask(t)}>✎</button>
+                      <button className="tl-btn postpone" title="Перенести дедлайн на завтра" onClick={() => postponeTask(t.id)}>→ Завтра</button>
                       <button className="tl-btn ok" title="Выполнено" onClick={() => toggleTaskDone(t.id)}>✓</button>
                       <button className="tl-btn remove" title="Удалить" onClick={() => removeTask(t.id)}>✕</button>
                     </div>
@@ -381,14 +479,14 @@ function App() {
             )}
 
             <div className="task-add-card">
-              <h4>➕ Новая задача</h4>
+              <h4>{editingTaskId ? "✎ Редактировать задачу" : "➕ Новая задача"}</h4>
               <input
                 type="text"
                 className="task-name-input"
                 placeholder="Что нужно сделать?"
                 value={newTask.name}
                 onChange={(e) => setNewTask({ ...newTask, name: e.target.value })}
-                onKeyDown={(e) => { if (e.key === "Enter") handleAddTask(); }}
+                onKeyDown={(e) => { if (e.key === "Enter") handleSaveTask(); }}
               />
               <div className="task-add-row">
                 <input
@@ -411,7 +509,10 @@ function App() {
                   value={newTask.deadline}
                   onChange={(e) => setNewTask({ ...newTask, deadline: e.target.value })}
                 />
-                <button className="btn-primary btn-small" onClick={handleAddTask}>＋</button>
+                <button className="btn-primary btn-small" onClick={handleSaveTask}>{editingTaskId ? "✓" : "＋"}</button>
+                {editingTaskId && (
+                  <button className="btn-secondary btn-small" onClick={resetTaskForm}>Отмена</button>
+                )}
               </div>
               <p className="planner-hint">
                 Задачи расставляются автоматически: раньше дедлайн и выше приоритет — раньше слот.
@@ -422,7 +523,7 @@ function App() {
             <div className="fixed-events-card">
               <div className="fixed-events-header">
                 <h4>📌 Фиксированные дела</h4>
-                <button className="btn-secondary btn-small" onClick={() => setShowEventForm(!showEventForm)}>{showEventForm ? "—" : "＋"}</button>
+                <button className="btn-secondary btn-small" onClick={() => { if (!showEventForm) resetEventForm(); setShowEventForm(!showEventForm); }}>{showEventForm ? "—" : "＋"}</button>
               </div>
               {state.fixedEvents.length === 0 && (
                 <p className="tasks-empty">Пусто. Добавьте работу, пары и другие дела с постоянным временем.</p>
@@ -434,7 +535,8 @@ function App() {
                     <span className="fe-days">{e.days.slice().sort((a, b) => ((a + 6) % 7) - ((b + 6) % 7)).map((d) => WEEKDAYS_SHORT[d]).join(" ")}</span>
                   </div>
                   <span className="fe-time">{e.startTime}–{e.endTime}</span>
-                  <button className="task-remove" onClick={() => removeFixedEvent(e.id)}>✕</button>
+                  <button className="task-remove fe-edit" title="Редактировать" onClick={() => handleEditEvent(e)}>✎</button>
+                  <button className="task-remove" title="Удалить" onClick={() => removeFixedEvent(e.id)}>✕</button>
                 </div>
               ))}
               {showEventForm && (
@@ -444,12 +546,12 @@ function App() {
                     placeholder="Например: Работа"
                     value={newEvent.name}
                     onChange={(e) => setNewEvent({ ...newEvent, name: e.target.value })}
-                    onKeyDown={(e) => { if (e.key === "Enter") handleAddEvent(); }}
+                    onKeyDown={(e) => { if (e.key === "Enter") handleSaveEvent(); }}
                   />
                   <div className="event-add-row">
-                    <input type="time" value={newEvent.startTime} onChange={(e) => setNewEvent({ ...newEvent, startTime: e.target.value })} />
+                    <TimeInput value={newEvent.startTime} onChange={(v) => setNewEvent({ ...newEvent, startTime: v })} />
                     <span className="fe-dash">—</span>
-                    <input type="time" value={newEvent.endTime} onChange={(e) => setNewEvent({ ...newEvent, endTime: e.target.value })} />
+                    <TimeInput value={newEvent.endTime} onChange={(v) => setNewEvent({ ...newEvent, endTime: v })} />
                   </div>
                   <div className="weekday-chips">
                     {[1, 2, 3, 4, 5, 6, 0].map((d) => (
@@ -463,7 +565,12 @@ function App() {
                       >{WEEKDAYS_SHORT[d]}</button>
                     ))}
                   </div>
-                  <button className="btn-primary btn-small" onClick={handleAddEvent}>Добавить</button>
+                  <div className="event-add-actions">
+                    <button className="btn-primary btn-small" onClick={handleSaveEvent}>{editingEventId ? "Сохранить" : "Добавить"}</button>
+                    {editingEventId && (
+                      <button className="btn-secondary btn-small" onClick={resetEventForm}>Отмена</button>
+                    )}
+                  </div>
                 </div>
               )}
             </div>
@@ -631,59 +738,12 @@ function App() {
                 placeholder="мин"
               />
             ) : (
-              <input
-                type="time"
+              <TimeInput
                 value={newReminder.specificTime}
-                onChange={(e) => setNewReminder({ ...newReminder, specificTime: e.target.value })}
+                onChange={(v) => setNewReminder({ ...newReminder, specificTime: v })}
               />
             )}
             <button className="btn-secondary" onClick={handleAddReminder}>＋</button>
-          </div>
-        </div>
-      )}
-
-      {/* Section name modal */}
-      {sectionModal && (
-        <div className="modal-overlay" onClick={() => setSectionModal(false)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <h3>Новый раздел</h3>
-            <input
-              type="text"
-              autoFocus
-              placeholder="Название раздела"
-              value={newSectionName}
-              onChange={(e) => setNewSectionName(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") {
-                  const name = newSectionName.trim();
-                  if (name) addSection(name);
-                  setSectionModal(false);
-                }
-                if (e.key === "Escape") setSectionModal(false);
-              }}
-            />
-            <div className="modal-actions">
-              <button className="btn-secondary" onClick={() => setSectionModal(false)}>Отмена</button>
-              <button className="btn-primary" onClick={() => {
-                const name = newSectionName.trim();
-                if (name) addSection(name);
-                setSectionModal(false);
-              }}>Добавить</button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Delete section confirmation modal */}
-      {deleteSectionId && (
-        <div className="modal-overlay" onClick={() => setDeleteSectionId(null)}>
-          <div className="modal-content" onClick={(e) => e.stopPropagation()}>
-            <h3>Удалить раздел?</h3>
-            <p className="modal-text">Вы точно хотите удалить раздел «{state.sections.find((s) => s.id === deleteSectionId)?.name}»?</p>
-            <div className="modal-actions">
-              <button className="btn-secondary" onClick={() => setDeleteSectionId(null)}>Отмена</button>
-              <button className="btn-primary btn-stop" onClick={() => { removeSection(deleteSectionId); setDeleteSectionId(null); }}>Удалить</button>
-            </div>
           </div>
         </div>
       )}
@@ -704,25 +764,39 @@ function App() {
           </label>
           <label>
             Сброс статистики в:
-            <input type="time" value={draftSettings.resetTime}
-              onChange={(e) => setDraftSettings({ ...draftSettings, resetTime: e.target.value })} />
+            <TimeInput value={draftSettings.resetTime}
+              onChange={(v) => setDraftSettings({ ...draftSettings, resetTime: v })} />
           </label>
           <label>
             Начало дня (план):
-            <input type="time" value={draftSettings.dayStart}
-              onChange={(e) => setDraftSettings({ ...draftSettings, dayStart: e.target.value })} />
+            <TimeInput value={draftSettings.dayStart}
+              onChange={(v) => setDraftSettings({ ...draftSettings, dayStart: v })} />
           </label>
           <label>
             Конец дня (план):
-            <input type="time" value={draftSettings.dayEnd}
-              onChange={(e) => setDraftSettings({ ...draftSettings, dayEnd: e.target.value })} />
+            <TimeInput value={draftSettings.dayEnd}
+              onChange={(v) => setDraftSettings({ ...draftSettings, dayEnd: v })} />
           </label>
           <label className="checkbox-label">
             <input type="checkbox" checked={state.autoStartEnabled}
               onChange={(e) => setAutoStart(e.target.checked)} />
             Автозапуск при включении ПК
           </label>
+          <button className="btn-secondary" onClick={() => notifyTaskStart("Тестовое уведомление")}>
+            Проверить уведомление
+          </button>
           <button className="btn-primary" onClick={handleSaveSettings}>Сохранить</button>
+        </div>
+      )}
+
+      {toasts.length > 0 && (
+        <div className="toasts">
+          {toasts.map((t) => (
+            <div key={t.id} className="toast" onClick={() => setToasts((prev) => prev.filter((x) => x.id !== t.id))}>
+              <div className="toast-title">{t.title}</div>
+              <div className="toast-body">{t.body}</div>
+            </div>
+          ))}
         </div>
       )}
     </main>

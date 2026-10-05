@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { Settings, DEFAULT_SETTINGS, Section, formatClock } from "./types";
+import { Settings, DEFAULT_SETTINGS, Section, Task, formatClock } from "./types";
+import { showMainWindow } from "./platform";
 
 const STORAGE_KEY = "pomodoro-state";
 
@@ -10,15 +11,19 @@ interface StoredState {
   isOnBreak: boolean;
   workSeconds: number;
   breakSecondsLeft: number;
+  nextBreakThreshold: number;
   settings: Settings;
   sections: Section[];
+  tasks: Task[];
   activeSectionId: string | null;
 }
+
+const EMPTY: StoredState = { isTracking: false, isPaused: false, isOnBreak: false, workSeconds: 0, breakSecondsLeft: 300, nextBreakThreshold: 900, settings: DEFAULT_SETTINGS, sections: [], tasks: [], activeSectionId: null };
 
 function loadState(): StoredState {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return { isTracking: false, isPaused: false, isOnBreak: false, workSeconds: 0, breakSecondsLeft: 300, settings: DEFAULT_SETTINGS, sections: [], activeSectionId: null };
+    if (!raw) return EMPTY;
     const parsed = JSON.parse(raw);
     return {
       isTracking: parsed.isTracking ?? false,
@@ -26,12 +31,14 @@ function loadState(): StoredState {
       isOnBreak: parsed.isOnBreak ?? false,
       workSeconds: parsed.workSeconds ?? 0,
       breakSecondsLeft: parsed.breakSecondsLeft ?? 300,
+      nextBreakThreshold: parsed.nextBreakThreshold ?? (parsed.settings ?? DEFAULT_SETTINGS).breakInterval * 60,
       settings: { ...DEFAULT_SETTINGS, ...parsed.settings },
       sections: parsed.sections ?? [],
+      tasks: parsed.tasks ?? [],
       activeSectionId: parsed.activeSectionId ?? null,
     };
   } catch {
-    return { isTracking: false, isPaused: false, isOnBreak: false, workSeconds: 0, breakSecondsLeft: 300, settings: DEFAULT_SETTINGS, sections: [], activeSectionId: null };
+    return EMPTY;
   }
 }
 
@@ -64,30 +71,19 @@ function Widget() {
     dragRef.current = { x: e.screenX, y: e.screenY, moved: false };
   };
 
-  const handleMouseMove = async (e: React.MouseEvent) => {
+  // Перетаскивание делает easy_drag у pywebview; здесь только помечаем,
+  // что мышь двигалась — чтобы drag не считался кликом
+  const handleMouseMove = (e: React.MouseEvent) => {
     if (!dragRef.current) return;
     const dx = Math.abs(e.screenX - dragRef.current.x);
     const dy = Math.abs(e.screenY - dragRef.current.y);
-    if (dx > 3 || dy > 3) {
-      if (!dragRef.current.moved) {
-        dragRef.current.moved = true;
-        try {
-          const { getCurrentWindow } = await import("@tauri-apps/api/window");
-          await getCurrentWindow().startDragging();
-        } catch { /* ignore */ }
-      }
-    }
+    if (dx > 3 || dy > 3) dragRef.current.moved = true;
   };
 
   const openMainApp = async () => {
     if (dragRef.current?.moved) return;
     try {
-      const { WebviewWindow } = await import("@tauri-apps/api/webviewWindow");
-      const main = await WebviewWindow.getByLabel("main");
-      if (main) {
-        await main.show();
-        await main.setFocus();
-      }
+      await showMainWindow();
     } catch { /* ignore */ }
   };
 
@@ -122,10 +118,14 @@ function Widget() {
     setState(loadState());
   };
 
-  const displaySeconds = state.isOnBreak ? state.breakSecondsLeft : state.workSeconds;
+  const activeTask = state.tasks.find((t) => !t.done && t.sectionId !== null && t.sectionId === state.activeSectionId);
+  const taskRemaining = activeTask ? Math.max(0, activeTask.durationMinutes * 60 - activeTask.trackedSeconds) : null;
+  const displaySeconds = state.isOnBreak ? state.breakSecondsLeft : taskRemaining ?? state.workSeconds;
   const accent = state.isOnBreak ? "#27ae60" : "#4a90d9";
   const activeSection = state.sections.find((s) => s.id === state.activeSectionId);
-  const sectionName = state.isOnBreak ? "Перерыв" : (activeSection?.name ?? "Без раздела");
+  const sectionName = state.isOnBreak ? "Перерыв" : (activeTask?.name ?? activeSection?.name ?? "Без задачи");
+  const taskProgress = activeTask ? Math.min(1, activeTask.trackedSeconds / (activeTask.durationMinutes * 60)) : null;
+  const breakLeft = state.isTracking && !state.isOnBreak ? Math.max(0, state.nextBreakThreshold - state.workSeconds) : null;
 
   return (
     <div
@@ -139,6 +139,12 @@ function Widget() {
         {formatClock(displaySeconds)}
       </div>
       <div className="widget-section">{sectionName}</div>
+      {taskProgress !== null && !state.isOnBreak && (
+        <div className="widget-progress"><div className="widget-progress-fill" style={{ width: `${taskProgress * 100}%` }} /></div>
+      )}
+      {breakLeft !== null && (
+        <div className="widget-break">☕ {formatClock(breakLeft)}</div>
+      )}
       {state.isTracking && !state.isPaused && !state.isOnBreak ? (
         <div className="widget-btns">
           <button
@@ -190,8 +196,8 @@ const styles = `
   align-items: center;
   justify-content: center;
   gap: 0.15rem;
-  width: 140px;
-  height: 80px;
+  width: 160px;
+  height: 96px;
   background: rgba(255, 255, 255, 0.95);
   border-radius: 12px;
   border: 1px solid #d0dce8;
@@ -251,6 +257,28 @@ const styles = `
   display: flex;
   gap: 0.3rem;
   margin-top: 0.1rem;
+}
+
+.widget-progress {
+  width: 110px;
+  height: 3px;
+  border-radius: 2px;
+  background: #dce8f5;
+  overflow: hidden;
+}
+
+.widget-progress-fill {
+  height: 100%;
+  background: var(--accent);
+  transition: width 0.5s ease;
+}
+
+.widget-break {
+  font-size: 0.6rem;
+  color: #43a047;
+  font-weight: 600;
+  font-variant-numeric: tabular-nums;
+  line-height: 1;
 }
 `;
 

@@ -1,9 +1,9 @@
 import { useCallback, useEffect, useRef, useState } from "react";
 import { DEFAULT_SETTINGS, Settings, Section, Reminder, DayStats, Task, FixedEvent, TaskPriority } from "./types";
-import { localDateStr, scheduleTasks, timeToMinutes } from "./scheduler";
+import { localDateStr, scheduleTasks, timeToMinutes, minutesToTime, occupiedMinutes, addDays } from "./scheduler";
 import { playBell } from "./sound";
 import { notifyBreakStart, notifyBreakEnd, notifyReminder, notifyTaskStart, notifyTaskDone } from "./notifications";
-import { enable, disable, isEnabled } from "@tauri-apps/plugin-autostart";
+import { autostartIsEnabled, autostartSet } from "./platform";
 
 interface TrackerState {
   isTracking: boolean;
@@ -91,6 +91,7 @@ function loadStored(): StoredState | null {
         ...t,
         scheduledDate: t.scheduledDate ?? null,
         scheduledStart: t.scheduledStart ?? null,
+        scheduledEnd: t.scheduledEnd ?? null,
         trackedSeconds: t.trackedSeconds ?? 0,
         sectionId: t.sectionId ?? null,
         startNotified: t.startNotified ?? false,
@@ -135,6 +136,7 @@ export function usePomodoro() {
   const [lastResetDate, setLastResetDate] = useState<string>(stored?.lastResetDate ?? todayStr());
   const [showDailyStats, setShowDailyStats] = useState(false);
   const [autoStartEnabled, setAutoStartEnabled] = useState(false);
+  const [schedTick, setSchedTick] = useState(0);
   const intervalRef = useRef<number | null>(null);
   const remindersRef = useRef<Reminder[]>(reminders);
   const tasksRef = useRef<Task[]>(tasks);
@@ -223,13 +225,21 @@ export function usePomodoro() {
     }
   }, []);
 
-  // Auto-scheduling: расставляем незавершённые и ещё не начатые задачи по свободным слотам
+  // Auto-scheduling: расставляем незавершённые задачи по свободным слотам;
+  // активная (выбранная в таймере) задача держит свой слот
   useEffect(() => {
-    const next = scheduleTasks(tasks, fixedEvents, settings);
+    const activeTaskId = tasks.find((t) => !t.done && t.sectionId !== null && t.sectionId === activeSectionId)?.id ?? null;
+    const next = scheduleTasks(tasks, fixedEvents, settings, activeTaskId);
     if (next.some((t, i) => t !== tasks[i])) {
       setTasks(next);
     }
-  }, [tasks, fixedEvents, settings]);
+  }, [tasks, fixedEvents, settings, activeSectionId, schedTick]);
+
+  // Раз в минуту пересчитываем план: просроченные задачи «плывут» вниз к текущему времени
+  useEffect(() => {
+    const id = window.setInterval(() => setSchedTick((v) => v + 1), 60000);
+    return () => window.clearInterval(id);
+  }, []);
 
   // Main timer tick
   useEffect(() => {
@@ -266,6 +276,19 @@ export function usePomodoro() {
                     if (t.id !== linked.id) return t;
                     const tracked = t.trackedSeconds + 1;
                     const justDone = tracked >= t.durationMinutes * 60 && t.trackedSeconds < t.durationMinutes * 60;
+                    // Первый тик по задаче — прибиваем её слот к текущему моменту
+                    if (t.trackedSeconds === 0) {
+                      const d = new Date();
+                      const nowMin = d.getHours() * 60 + d.getMinutes();
+                      return {
+                        ...t,
+                        trackedSeconds: tracked,
+                        done: t.done || justDone,
+                        scheduledDate: localDateStr(),
+                        scheduledStart: minutesToTime(nowMin),
+                        scheduledEnd: minutesToTime(nowMin + occupiedMinutes(t.durationMinutes, settings)),
+                      };
+                    }
                     return { ...t, trackedSeconds: tracked, done: t.done || justDone };
                   })
                 );
@@ -489,6 +512,7 @@ export function usePomodoro() {
       id: genId(),
       scheduledDate: null,
       scheduledStart: null,
+      scheduledEnd: null,
       done: false,
       trackedSeconds: 0,
       sectionId: null,
@@ -499,16 +523,35 @@ export function usePomodoro() {
   }, []);
 
   const removeTask = useCallback((id: string) => {
+    const task = tasksRef.current.find((t) => t.id === id);
     setTasks((prev) => prev.filter((t) => t.id !== id));
+    // Чистим раздел удалённой задачи, иначе таймер продолжит писать в «сироту»
+    if (task?.sectionId) {
+      setSections((prev) => prev.filter((s) => s.id !== task.sectionId));
+      setActiveSectionId((curr) => (curr === task.sectionId ? null : curr));
+    }
   }, []);
 
   const toggleTaskDone = useCallback((id: string) => {
     setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, done: !t.done } : t)));
   }, []);
 
-  // Запуск трекинга задачи: создаёт/переиспользует раздел и включает таймер
-  const startTask = useCallback((id: string) => {
-    if (isOnBreak) return;
+  // Перенос задачи на завтра (когда не влезла в сегодняшний день)
+  const postponeTask = useCallback((id: string) => {
+    const tomorrow = addDays(localDateStr(), 1);
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, deadline: tomorrow } : t)));
+  }, []);
+
+  const updateTask = useCallback((id: string, data: { name: string; durationMinutes: number; priority: TaskPriority; deadline: string }) => {
+    setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, ...data } : t)));
+  }, []);
+
+  // Выбор задачи для таймера: привязывает/создаёт раздел и делает его активным
+  const selectTask = useCallback((id: string | null) => {
+    if (!id) {
+      setActiveSectionId(null);
+      return;
+    }
     const task = tasksRef.current.find((t) => t.id === id);
     if (!task || task.done) return;
     let sectionId = task.sectionId;
@@ -518,13 +561,40 @@ export function usePomodoro() {
       setTasks((prev) => prev.map((t) => (t.id === id ? { ...t, sectionId } : t)));
     }
     setActiveSectionId(sectionId);
+  }, []);
+
+  // Запуск трекинга задачи: привязывает задачу, прибивает слот к «сейчас» и включает таймер
+  const startTask = useCallback((id: string) => {
+    if (isOnBreak) return;
+    const task = tasksRef.current.find((t) => t.id === id);
+    if (!task || task.done) return;
+    selectTask(id);
+    const d = new Date();
+    const nowMin = d.getHours() * 60 + d.getMinutes();
+    const remainingMin = Math.max(1, Math.ceil(task.durationMinutes - task.trackedSeconds / 60));
+    setTasks((prev) =>
+      prev.map((t) =>
+        t.id === id
+          ? {
+              ...t,
+              scheduledDate: localDateStr(),
+              scheduledStart: minutesToTime(nowMin),
+              scheduledEnd: minutesToTime(nowMin + occupiedMinutes(remainingMin, settings)),
+            }
+          : t
+      )
+    );
     setIsTracking(true);
     setIsPaused(false);
-  }, [isOnBreak]);
+  }, [isOnBreak, selectTask, settings]);
 
   // Planner: фиксированные дела
   const addFixedEvent = useCallback((data: { name: string; startTime: string; endTime: string; days: number[] }) => {
     setFixedEvents((prev) => [...prev, { ...data, id: genId() }]);
+  }, []);
+
+  const updateFixedEvent = useCallback((id: string, data: { name: string; startTime: string; endTime: string; days: number[] }) => {
+    setFixedEvents((prev) => prev.map((e) => (e.id === id ? { ...e, ...data } : e)));
   }, []);
 
   const removeFixedEvent = useCallback((id: string) => {
@@ -538,13 +608,13 @@ export function usePomodoro() {
   // Autostart
   const setAutoStart = useCallback(async (enabled: boolean) => {
     try {
-      if (enabled) await enable(); else await disable();
+      await autostartSet(enabled);
       setAutoStartEnabled(enabled);
     } catch { /* ignore */ }
   }, []);
 
   useEffect(() => {
-    isEnabled().then((e) => setAutoStartEnabled(e)).catch(() => {});
+    autostartIsEnabled().then((e) => setAutoStartEnabled(e)).catch(() => {});
   }, []);
 
   const state: TrackerState = {
@@ -557,8 +627,8 @@ export function usePomodoro() {
     state, startTracking, stopTracking, pauseTracking, resumeTracking, toggleTracking, updateSettings,
     addSection, removeSection, selectSection,
     addReminder, removeReminder, toggleReminder, confirmReminder,
-    addTask, removeTask, toggleTaskDone, startTask,
-    addFixedEvent, removeFixedEvent, setDayBounds,
+    addTask, removeTask, toggleTaskDone, postponeTask, updateTask, startTask, selectTask,
+    addFixedEvent, updateFixedEvent, removeFixedEvent, setDayBounds,
     setShowDailyStats, setAutoStart,
   };
 }

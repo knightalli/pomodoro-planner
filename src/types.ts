@@ -39,6 +39,7 @@ export interface Task {
   deadline: string; // YYYY-MM-DD
   scheduledDate: string | null; // YYYY-MM-DD, назначается планировщиком
   scheduledStart: string | null; // HH:MM
+  scheduledEnd: string | null; // HH:MM, конец слота с учётом перерывов
   done: boolean;
   trackedSeconds: number; // натрекано таймером через связанный раздел
   sectionId: string | null; // раздел тайм-трекера

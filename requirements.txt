@@ -1,0 +1,4 @@
+pywebview>=6
+pystray>=0.19
+pillow>=10
+windows-toasts>=1.3

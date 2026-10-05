@@ -155,11 +155,52 @@
   color: var(--text);
 }
 
+/* 24h time input: два селекта ЧЧ : ММ */
+.time-input {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+}
+
+.time-input select {
+  padding: 0.35rem 0.4rem;
+  border-radius: 8px;
+  border: 1px solid var(--border);
+  background: #f8fbff;
+  color: var(--text);
+  font-size: 0.85rem;
+  font-family: inherit;
+  font-variant-numeric: tabular-nums;
+  outline: none;
+  transition: border-color 0.2s;
+}
+
+.time-input select:focus {
+  border-color: var(--accent);
+}
+
+.time-sep {
+  color: var(--text-muted);
+  font-weight: 700;
+}
+
 .mode-label {
   font-size: 0.9rem;
   color: var(--text-muted);
   margin-top: 0.25rem;
   font-weight: 500;
+}
+
+/* Active task progress under timer */
+.timer-task-progress {
+  width: 100%;
+  max-width: 240px;
+  display: flex;
+  flex-direction: column;
+  gap: 0.3rem;
+  font-size: 0.75rem;
+  color: var(--text-muted);
+  font-variant-numeric: tabular-nums;
 }
 
 /* Controls */
@@ -1077,10 +1118,25 @@
 }
 
 .tl-progress {
+  position: relative;
   height: 4px;
   border-radius: 2px;
   background: #dce8f5;
   overflow: hidden;
+}
+
+.tl-break-band {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  background: rgba(67, 160, 71, 0.55);
+}
+
+.timer-break-left {
+  font-size: 0.72rem;
+  color: #43a047;
+  font-variant-numeric: tabular-nums;
+  font-weight: 600;
 }
 
 .tl-progress-fill {
@@ -1119,6 +1175,18 @@
 
 .tl-btn.ok { color: #27ae60; }
 .tl-btn.ok:hover { background: #27ae60; border-color: #27ae60; color: #fff; }
+
+.tl-btn.edit { color: var(--text-muted); }
+.tl-btn.edit:hover { color: var(--accent-dark); background: rgba(74, 144, 217, 0.1); border-color: var(--accent); }
+
+.tl-btn.postpone {
+  width: auto;
+  padding: 0 0.5rem;
+  font-size: 0.68rem;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tl-btn.postpone:hover { color: var(--accent-dark); border-color: var(--accent); background: rgba(74, 144, 217, 0.1); }
 
 .tl-btn.remove { color: var(--text-muted); }
 .tl-btn.remove:hover { color: #e74c3c; background: rgba(231, 76, 60, 0.1); border-color: #e74c3c; }
@@ -1321,6 +1389,31 @@
   color: var(--text-muted);
 }
 
+.fe-edit:hover {
+  color: var(--accent-dark);
+  background: rgba(74, 144, 217, 0.1);
+}
+
+.event-add-actions {
+  display: flex;
+  gap: 0.4rem;
+  justify-content: flex-end;
+}
+
+.event-add-actions .btn-primary,
+.event-add-actions .btn-secondary {
+  align-self: auto;
+}
+
+.tl-breaks {
+  font-size: 0.68rem;
+  color: var(--accent-dark);
+  background: rgba(74, 144, 217, 0.08);
+  padding: 0.1rem 0.35rem;
+  border-radius: 4px;
+  white-space: nowrap;
+}
+
 .weekday-chips {
   display: flex;
   gap: 0.3rem;
@@ -1348,4 +1441,45 @@
 
 .event-add .btn-primary {
   align-self: flex-end;
+}
+
+/* In-app toasts */
+.toasts {
+  position: fixed;
+  top: 10px;
+  left: 10px;
+  right: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  z-index: 1000;
+  pointer-events: none;
+}
+
+.toast {
+  pointer-events: auto;
+  background: var(--bg-card, #1e2130);
+  border: 1px solid var(--accent, #4a90d9);
+  border-left: 4px solid var(--accent, #4a90d9);
+  border-radius: 8px;
+  padding: 0.6rem 0.8rem;
+  box-shadow: 0 4px 16px rgba(0, 0, 0, 0.35);
+  cursor: pointer;
+  animation: toast-in 0.2s ease-out;
+}
+
+.toast-title {
+  font-weight: 700;
+  font-size: 0.8rem;
+  margin-bottom: 0.15rem;
+}
+
+.toast-body {
+  font-size: 0.75rem;
+  color: var(--text-muted, #9aa);
+}
+
+@keyframes toast-in {
+  from { opacity: 0; transform: translateY(-6px); }
+  to { opacity: 1; transform: translateY(0); }
 }
