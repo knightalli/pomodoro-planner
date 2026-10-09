@@ -5,13 +5,19 @@
     python app.py --dev    — фронтенд с vite dev-сервера (http://localhost:1420)
 
 Оба окна грузятся с одного localhost-порта → общий localStorage,
-виджет синхронизируется через storage-события, как и в Tauri-версии.
+виджет синхронизируется через storage-события.
+
+Персистентность: порт сервера фиксирован (PORT) — иначе origin менялся бы при
+каждом запуске и localStorage не переживал перезапуск; плюс webview.start
+запускается с private_mode=False и своим storage_path (не InPrivate-профиль).
 """
 
 from __future__ import annotations
 
 import argparse
 import http.server
+import logging
+import os
 import sys
 import threading
 import winreg
@@ -19,11 +25,15 @@ from pathlib import Path
 
 import webview
 
+logger = logging.getLogger(__name__)
+
 ROOT = Path(__file__).resolve().parent
 DIST = ROOT / "dist"
 APP_NAME = "Тайм-трекер"
 REG_NAME = "TimeTracker"
 RUN_KEY = r"Software\Microsoft\Windows\CurrentVersion\Run"
+PORT = 31873
+STORAGE = Path(os.environ.get("APPDATA", str(ROOT))) / "TimeTracker"
 
 main_window: webview.Window | None = None
 widget_window: webview.Window | None = None
@@ -38,9 +48,14 @@ class DistHandler(http.server.SimpleHTTPRequestHandler):
 
 
 def start_server() -> str:
-    httpd = http.server.ThreadingHTTPServer(("127.0.0.1", 0), DistHandler)
+    try:
+        httpd = http.server.ThreadingHTTPServer(("127.0.0.1", PORT), DistHandler)
+    except OSError:
+        # Занятый порт — почти наверняка уже запущенный экземпляр: не создаём
+        # второй (два приложения на одном localStorage тикали бы таймер дважды).
+        sys.exit(f"Порт {PORT} занят — вероятно, {APP_NAME} уже запущен.")
     threading.Thread(target=httpd.serve_forever, daemon=True).start()
-    return f"http://127.0.0.1:{httpd.server_port}"
+    return f"http://127.0.0.1:{PORT}"
 
 
 _toaster = None
@@ -57,7 +72,7 @@ def send_toast(title: str, body: str) -> None:
         toast.text_fields = [title, body]
         _toaster.show_toast(toast)
     except Exception:
-        pass
+        logger.exception("send_toast failed")
 
 
 def _autostart_cmd() -> str:
@@ -88,10 +103,27 @@ def set_autostart(enabled: bool) -> None:
                 pass
 
 
+def _primary_work_area() -> tuple[int, int, int, int]:
+    """(left, top, right, bottom) рабочей области основного экрана в лог. px.
+
+    frame — WorkingArea из WinForms, т.е. экран минус панель задач.
+    """
+    try:
+        screens = webview.screens
+        primary = next((s for s in screens if s.x == 0 and s.y == 0), screens[0])
+        area = getattr(primary, "frame", None)
+        if area:
+            return int(area.Left), int(area.Top), int(area.Right), int(area.Bottom)
+        return primary.x, primary.y, primary.x + primary.width, primary.y + primary.height
+    except Exception:
+        return 0, 0, 1600, 900
+
+
 class Api:
     """Мост JS → Python. Доступен как window.pywebview.api.*"""
 
-    widget_visible = False
+    def __init__(self) -> None:
+        self.widget_visible = False
 
     def notify(self, title: str, body: str) -> None:
         send_toast(str(title), str(body))
@@ -117,7 +149,7 @@ class Api:
 def tray_image():
     from PIL import Image
 
-    icon = ROOT / "icon.png"
+    icon = ROOT / "public" / "icon.png"
     if icon.exists():
         return Image.open(icon)
     img = Image.new("RGBA", (64, 64), (0, 0, 0, 0))
@@ -161,13 +193,15 @@ def main() -> None:
 
     global main_window, widget_window
     api = Api()
+    left, top, right, bottom = _primary_work_area()
     main_window = webview.create_window(
         APP_NAME, f"{base}/index.html",
-        js_api=api, width=560, height=720, min_size=(460, 600),
+        js_api=api, width=620, height=max(600, bottom - top), min_size=(460, 600),
     )
     widget_window = webview.create_window(
         APP_NAME, f"{base}/widget.html",
         js_api=api, width=160, height=96, resizable=False,
+        x=right - 172, y=bottom - 108,
         frameless=True, on_top=True, transparent=True, hidden=True,
     )
 
@@ -180,11 +214,20 @@ def main() -> None:
         widget_window.hide()
         return False
 
+    def guard_widget():
+        # Виджет стартует скрытым; если ОС мигнёт окном при запуске — прячем
+        if not api.widget_visible:
+            widget_window.hide()
+
     main_window.events.closing += hide_main
     widget_window.events.closing += hide_widget
+    widget_window.events.shown += guard_widget
+    timer = threading.Timer(1.5, guard_widget)  # страховка, если shown не выстрелит
+    timer.daemon = True
+    timer.start()
 
     threading.Thread(target=run_tray, daemon=True).start()
-    webview.start()
+    webview.start(private_mode=False, storage_path=str(STORAGE))
 
 
 if __name__ == "__main__":

@@ -25,7 +25,5 @@ python -m venv .venv && .venv\Scripts\pip install -r requirements.txt
 
 - 📖 [Руководство пользователя](docs/USER_GUIDE.md) — как пользоваться приложением.
 - 🛠 [Руководство разработчика](docs/DEV_GUIDE.md) — архитектура, запуск, устройство кода.
+- 🧾 [Аудит и техдолг](docs/TECH_DEBT.md) — известные проблемы и план улучшений.
 
-## Recommended IDE Setup
-
-- [VS Code](https://code.visualstudio.com/) + [Python](https://marketplace.visualstudio.com/items?itemName=ms-python.python)

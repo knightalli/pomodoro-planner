@@ -37,7 +37,7 @@
 
 .container > *:not(.nav-tabs):not(.timer-wrapper):not(.modal-overlay) {
   width: 100%;
-  max-width: 420px;
+  max-width: 520px;
   padding-left: 1.5rem;
   padding-right: 1.5rem;
 }
@@ -50,7 +50,7 @@
   display: flex;
   gap: 0.25rem;
   width: 100%;
-  max-width: 420px;
+  max-width: 520px;
   background: var(--bg-card);
   border-radius: 0;
   padding: 0.75rem 1rem;
@@ -88,7 +88,7 @@
   gap: 0.4rem;
   align-items: center;
   width: 100%;
-  max-width: 320px;
+  max-width: 460px;
 }
 
 .section-dropdown {
@@ -290,6 +290,16 @@
   font-size: 0.85rem;
 }
 
+.btn-done {
+  color: #27ae60;
+}
+
+.btn-done:hover {
+  background: rgba(39, 174, 96, 0.1);
+  border-color: #27ae60;
+  color: #1e8449;
+}
+
 .btn-danger {
   color: #e74c3c;
 }
@@ -337,7 +347,7 @@
   border-radius: 16px;
   padding: 1.5rem;
   width: 100%;
-  max-width: 320px;
+  max-width: 460px;
   box-shadow: 0 4px 16px rgba(74, 144, 217, 0.12);
 }
 
@@ -388,7 +398,7 @@
   flex-direction: column;
   gap: 0.2rem;
   width: 100%;
-  max-width: 280px;
+  max-width: 400px;
   background: var(--bg-card);
   border-radius: 10px;
   padding: 0.6rem 1rem;
@@ -546,7 +556,7 @@
 /* Stats section */
 .stats-section {
   width: 100%;
-  max-width: 360px;
+  max-width: 520px;
   display: flex;
   flex-direction: column;
   gap: 1rem;
@@ -675,7 +685,7 @@
 /* Reminders section */
 .reminders-section {
   width: 100%;
-  max-width: 360px;
+  max-width: 520px;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
@@ -881,7 +891,7 @@
 /* Planner section */
 .planner-section {
   width: 100%;
-  max-width: 380px;
+  max-width: 520px;
   display: flex;
   flex-direction: column;
   gap: 0.75rem;
@@ -1258,6 +1268,7 @@
   display: flex;
   gap: 0.4rem;
   align-items: center;
+  flex-wrap: wrap;
 }
 
 .task-add-row input[type="number"] {
@@ -1274,7 +1285,7 @@
 
 .task-add-row select {
   flex: 1;
-  min-width: 0;
+  min-width: 150px;
   padding: 0.45rem 0.35rem;
   border-radius: 8px;
   border: 1px solid var(--border);

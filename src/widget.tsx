@@ -1,58 +1,18 @@
 import React, { useEffect, useRef, useState } from "react";
 import ReactDOM from "react-dom/client";
-import { Settings, DEFAULT_SETTINGS, Section, Task, formatClock } from "./types";
+import { formatClock } from "./types";
+import { STORAGE_KEY, StoredState, defaultStored, loadStored } from "./storage";
 import { showMainWindow } from "./platform";
-
-const STORAGE_KEY = "pomodoro-state";
-
-interface StoredState {
-  isTracking: boolean;
-  isPaused: boolean;
-  isOnBreak: boolean;
-  workSeconds: number;
-  breakSecondsLeft: number;
-  nextBreakThreshold: number;
-  settings: Settings;
-  sections: Section[];
-  tasks: Task[];
-  activeSectionId: string | null;
-}
-
-const EMPTY: StoredState = { isTracking: false, isPaused: false, isOnBreak: false, workSeconds: 0, breakSecondsLeft: 300, nextBreakThreshold: 900, settings: DEFAULT_SETTINGS, sections: [], tasks: [], activeSectionId: null };
+import { sendWidgetCommand } from "./bridge";
+import { useNow } from "./useNow";
 
 function loadState(): StoredState {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    if (!raw) return EMPTY;
-    const parsed = JSON.parse(raw);
-    return {
-      isTracking: parsed.isTracking ?? false,
-      isPaused: parsed.isPaused ?? false,
-      isOnBreak: parsed.isOnBreak ?? false,
-      workSeconds: parsed.workSeconds ?? 0,
-      breakSecondsLeft: parsed.breakSecondsLeft ?? 300,
-      nextBreakThreshold: parsed.nextBreakThreshold ?? (parsed.settings ?? DEFAULT_SETTINGS).breakInterval * 60,
-      settings: { ...DEFAULT_SETTINGS, ...parsed.settings },
-      sections: parsed.sections ?? [],
-      tasks: parsed.tasks ?? [],
-      activeSectionId: parsed.activeSectionId ?? null,
-    };
-  } catch {
-    return EMPTY;
-  }
-}
-
-function saveState(partial: Record<string, unknown>) {
-  try {
-    const raw = localStorage.getItem(STORAGE_KEY);
-    const parsed = raw ? JSON.parse(raw) : {};
-    Object.assign(parsed, partial);
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
-  } catch { /* ignore */ }
+  return loadStored() ?? defaultStored();
 }
 
 function Widget() {
   const [state, setState] = useState<StoredState>(loadState);
+  const now = useNow();
   const dragRef = useRef<{ x: number; y: number; moved: boolean } | null>(null);
 
   useEffect(() => {
@@ -87,45 +47,30 @@ function Widget() {
     } catch { /* ignore */ }
   };
 
-  const toggleTracking = async (e: React.MouseEvent) => {
+  // Управление таймером — командами в главное окно; само состояние не трогаем
+  const send = (cmd: "toggle" | "pause" | "resume") => (e: React.MouseEvent) => {
     e.stopPropagation();
-    if (state.isOnBreak) return;
-    try {
-      const raw = localStorage.getItem(STORAGE_KEY);
-      if (!raw) return;
-      const parsed = JSON.parse(raw);
-      const newTracking = !parsed.isTracking;
-      parsed.isTracking = newTracking;
-      parsed.isPaused = false;
-      if (!newTracking) {
-        parsed.workSeconds = 0;
-        parsed.nextBreakThreshold = (parsed.settings ?? DEFAULT_SETTINGS).breakInterval * 60;
-      }
-      localStorage.setItem(STORAGE_KEY, JSON.stringify(parsed));
-      setState(loadState());
-    } catch { /* ignore */ }
-  };
-
-  const handlePause = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    saveState({ isPaused: true });
-    setState(loadState());
-  };
-
-  const handleResume = (e: React.MouseEvent) => {
-    e.stopPropagation();
-    saveState({ isPaused: false });
-    setState(loadState());
+    sendWidgetCommand(cmd);
   };
 
   const activeTask = state.tasks.find((t) => !t.done && t.sectionId !== null && t.sectionId === state.activeSectionId);
   const taskRemaining = activeTask ? Math.max(0, activeTask.durationMinutes * 60 - activeTask.trackedSeconds) : null;
-  const displaySeconds = state.isOnBreak ? state.breakSecondsLeft : taskRemaining ?? state.workSeconds;
+  // «Живые» значения по timestamp-якорям — виджет досчитывает сам, не дожидаясь
+  // записи главным окном
+  const liveWork = state.workSeconds + (
+    state.isTracking && !state.isPaused && state.workStartedAt !== null
+      ? Math.max(0, Math.floor((now - state.workStartedAt) / 1000))
+      : 0
+  );
+  const liveBreakLeft = state.breakEndsAt !== null
+    ? Math.max(0, Math.ceil((state.breakEndsAt - now) / 1000))
+    : state.breakSecondsLeft;
+  const displaySeconds = state.isOnBreak ? liveBreakLeft : taskRemaining ?? liveWork;
   const accent = state.isOnBreak ? "#27ae60" : "#4a90d9";
   const activeSection = state.sections.find((s) => s.id === state.activeSectionId);
   const sectionName = state.isOnBreak ? "Перерыв" : (activeTask?.name ?? activeSection?.name ?? "Без задачи");
   const taskProgress = activeTask ? Math.min(1, activeTask.trackedSeconds / (activeTask.durationMinutes * 60)) : null;
-  const breakLeft = state.isTracking && !state.isOnBreak ? Math.max(0, state.nextBreakThreshold - state.workSeconds) : null;
+  const breakLeft = state.isTracking && !state.isOnBreak ? Math.max(0, state.nextBreakThreshold - liveWork) : null;
 
   return (
     <div
@@ -149,13 +94,13 @@ function Widget() {
         <div className="widget-btns">
           <button
             className="widget-btn"
-            onClick={handlePause}
+            onClick={send("pause")}
             onMouseDown={(e) => e.stopPropagation()}
             style={{ background: "#f39c12" }}
           >⏸</button>
           <button
             className="widget-btn"
-            onClick={toggleTracking}
+            onClick={send("toggle")}
             onMouseDown={(e) => e.stopPropagation()}
             style={{ background: "#e74c3c" }}
           >⏹</button>
@@ -164,13 +109,13 @@ function Widget() {
         <div className="widget-btns">
           <button
             className="widget-btn"
-            onClick={handleResume}
+            onClick={send("resume")}
             onMouseDown={(e) => e.stopPropagation()}
             style={{ background: "var(--accent)" }}
           >▶</button>
           <button
             className="widget-btn"
-            onClick={toggleTracking}
+            onClick={send("toggle")}
             onMouseDown={(e) => e.stopPropagation()}
             style={{ background: "#e74c3c" }}
           >⏹</button>
@@ -178,7 +123,7 @@ function Widget() {
       ) : (
         <button
           className="widget-btn"
-          onClick={toggleTracking}
+          onClick={send("toggle")}
           onMouseDown={(e) => e.stopPropagation()}
           style={{ background: state.isTracking ? "#e74c3c" : "var(--accent)" }}
         >
